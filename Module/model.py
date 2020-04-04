@@ -1,184 +1,92 @@
-from __future__ import print_function
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from Module.decoder import GreedyDecoder
-import matplotlib.pyplot as plt
 
 
-class Wav2Letter(nn.Module):
-    """Wav2Letter Speech Recognition model
-        Args:
-            num_features (int): number of mfcc features
-            num_classes (int): number of unique grapheme class labels
-    """
+def get_same_pad(k, s, d):
+    assert not (s > 1 and d > 1)
+    if s > 1:
+        return (k-s+1)//2
+    return (k-1)*d//2
 
-    def __init__(self, num_features, num_classes, criterion, device, notebook=True):
+
+class ResBlock(nn.Module):
+
+    def __init__(self, in_c, out_c, kernel, stride, dilation, dropout):
         
-        super(Wav2Letter, self).__init__()
-        if notebook:
-            from tqdm import tqdm_notebook as tqdm
-        else:
-            from tqdm import tqdm
-        self.tqdm = tqdm
-        self.device = device
-        self.criterion = criterion
+        super(ResBlock, self).__init__()
+        conv1 = nn.Conv1d(in_c, out_c, kernel, padding=get_same_pad(kernel, 1, dilation), dilation=dilation)
+        bn1 = nn.BatchNorm1d(out_c)
+        relu1 = nn.ReLU()
+        do1 = nn.Dropout(p=dropout)
+        self.conv_block = nn.Sequential(conv1, bn1, relu1, do1)
+        self.scale = nn.Conv1d(in_c, out_c, 1)
+        self.pool = None
+        if stride > 1:
+            self.pool = nn.AvgPool1d(stride, padding=get_same_pad(stride, stride, 1))
+
+    def forward(self, x):
+        h = self.conv_block(x)
+        scaled = self.scale(x)
+        h += scaled
+        return self.pool(h) if self.pool else h
+
+
+class StreamBlock(nn.Module):
+    def __init__(self, in_channel, out_channels, kernels, strides, dilation, dropout, n_attention_heads, n_hidden):
+        super(StreamBlock, self).__init__()
+        
+        self.conv_blocks = nn.ModuleList()
+        n = len(kernels)
+        for i in range(n):
+            in_c = in_channel if i == 0 else out_channels[i-1]
+            block = ResBlock(in_c, out_channels[i], kernels[i], strides[i], dilation, dropout)
+            self.conv_blocks.append(block)
+                
+        self.attention = nn.MultiheadAttention(out_channels[-1], n_attention_heads)
+        self.lnorm1 = nn.LayerNorm([out_channels[-1]])
+        self.ff = nn.Linear(out_channels[-1], n_hidden)
+        self.lnorm2 = nn.LayerNorm([n_hidden])
+#         self.relu = nn.ReLU()
+
+
+    def forward(self, x):
+        h = x
+        for block in self.conv_blocks:
+            h = block(h)
+        att_in = h.permute(2,0,1)
+        att_out, att_weight = self.attention(att_in,att_in,att_in)
+        h = att_out.permute(1,0,2)
+        h = self.lnorm1(h)
+        h = self.lnorm2(self.ff(h))
+        return h #self.relu(h)
+        
+        
+
+class MultiStreamSelfAttentionModel(nn.Module):
+    def __init__(self, n_streams, in_channels, num_classes , out_channels, kernels, 
+                 strides, dilations, n_attention_heads, n_hidden, dropout):
+        
+        super(MultiStreamSelfAttentionModel, self).__init__()
         self.history = {'train':[], 'val':[]}
         
-        # Conv1d(in_channels, out_channels, kernel_size, stride)
-        self.layers = nn.Sequential(
-            nn.Conv1d(num_features, 250, 31, 2),
-            nn.BatchNorm1d(250, affine=False),
-            torch.nn.ReLU(),
-            nn.Conv1d(250, 250, 19),
-            nn.BatchNorm1d(250, affine=False),
-            torch.nn.ReLU(),
-            nn.Conv1d(250, 250, 17),
-            nn.BatchNorm1d(250, affine=False),
-            torch.nn.ReLU(),
-            nn.Conv1d(250, 250, 11),
-            nn.BatchNorm1d(250, affine=False),
-            torch.nn.ReLU(),
-            nn.Conv1d(250, 250, 7),
-            nn.BatchNorm1d(250, affine=False),
-            torch.nn.ReLU(),
-            nn.Conv1d(250, 250, 7),
-            nn.BatchNorm1d(250, affine=False),
-            torch.nn.ReLU(),
-            nn.Conv1d(250, 250, 5),
-            nn.BatchNorm1d(250, affine=False),
-            torch.nn.ReLU(),
-            nn.Conv1d(250, 250, 5),
-            nn.BatchNorm1d(250, affine=False),
-            torch.nn.ReLU(),
-            nn.Conv1d(250, 500, 5),
-            nn.BatchNorm1d(500, affine=False),
-            torch.nn.ReLU(),
-            nn.Conv1d(500, 500, 1),
-            nn.BatchNorm1d(500, affine=False),
-            torch.nn.ReLU(),
-            nn.Conv1d(500, num_classes, 1),
-        )
-        self.to(device)
-
-    def forward(self, batch):
-        """Forward pass through Wav2Letter network than 
-            takes log probability of output
-
-        Args:
-            batch (int): mini batch of data
-             shape (batch, num_features, frame_len)
-
-        Returns:
-            log_probs (torch.Tensor):
-                shape  (batch_size, num_classes, output_len)
-        """
-        # y_pred shape (batch_size, num_classes, output_len)
-        y_pred = self.layers(batch)
-
-        # compute log softmax probability on graphemes
-        log_probs = F.log_softmax(y_pred, dim=1)
-
-        return log_probs
-
-    def fit(self, train_loader, epochs, optimizer, val_loader=None, verbose=10, checkpoint=50):
-        """Trains Wav2Letter model.
-
-        Args:
-            inputs (torch.Tensor): shape (sample_size, num_features, frame_len)
-            output (torch.Tensor): shape (sample_size, seq_len)
-            epochs (int): number of epochs
-        """
-        
-        self.train()
-        for t in self.tqdm(range(epochs)):
-            total_loss = 0.
-            num_samples = 0
-            for batch in train_loader:
-                optimizer.zero_grad()
-                
-                # reading data
-                x, y = batch
-                batch_size = x.shape[0]
-                output_shape = y.shape[1]
-
-                # log_probs shape (batch_size, num_classes, output_len)
-                log_probs = self.forward(x.to(self.device))
-
-                # CTC_Loss expects input shape
-                # (input_length, batch_size, num_classes)
-                log_probs = log_probs.transpose(1, 2).transpose(0, 1)
-
-                # CTC arguments
-                # https://discuss.pytorch.org/t/ctcloss-with-warp-ctc-help/8788/3
-                input_lengths = torch.full((batch_size,), log_probs.shape[0], dtype=torch.long)
-                target_lengths = torch.full((batch_size,), output_shape, dtype=torch.long)
-
-                loss = self.criterion(log_probs, y.to(self.device), input_lengths, target_lengths)
-
-                total_loss += loss.item()
-                num_samples += batch_size
-                
-                loss.backward()
-                optimizer.step()
+        self.streams = nn.ModuleList()
+        for i in range(n_streams):
+            stream = StreamBlock(in_channels, out_channels, kernels, strides, dilations[i],
+                                 dropout, n_attention_heads, n_hidden)
+            self.streams.append(stream)
             
-            total_loss /= num_samples
-            self.history['train'] += [total_loss]
-            log = " loss : " + str(total_loss)
-            if val_loader:
-                val_loss = self.eval(val_loader, out=False)
-                self.history['val'] += [val_loss]
-                log += " val loss : " + str(val_loss)
-
-            if (t+1) % verbose == 0:
-                print("epoch", t + 1,log)
-            if (t+1) % checkpoint == 0:
-                self.save(t+1)
-                
-
-    def eval(self, loader, decoder=None, metric=None, out=True):
-        self.train(False)
-        total_loss = 0.
-        num_samples = 0
-        outputs = torch.Tensor([])
-        with torch.no_grad():
-            for batch in loader:
-                x, y = batch
-                batch_size = x.shape[0]
-                output_shape = y.shape[1]
-                log_probs = self.forward(x.to(self.device))
-                log_probs = log_probs.transpose(1, 2).transpose(0, 1)
-                input_lengths = torch.full((batch_size,), log_probs.shape[0], dtype=torch.long)
-                target_lengths = torch.full((batch_size,), output_shape, dtype=torch.long)
-                loss = self.criterion(log_probs, y.to(self.device), input_lengths, target_lengths)
-                total_loss += loss.item()
-                num_samples += batch_size
-                if out:
-                    output = decoder(log_probs).cpu().float()
-                    outputs = torch.cat([outputs, output.view(1, output.shape[0])], dim=0)
-
-        if out:
-            return outputs, total_loss/num_samples
-        return total_loss/num_samples
-    
-    def plot_hist(self):
-        plt.plot(self.history['train'])
-        plt.plot(self.history['val'])
-        plt.legend(['train', 'val'])
-        plt.show()
+        self.dense = nn.Linear(n_hidden*n_streams, num_classes, bias=False)
+        self.relu = nn.ReLU()
+        self.bn = nn.BatchNorm1d(num_classes)
+        self.do = nn.Dropout(p=dropout)
         
-    def get_n_params(self):
-        pp=0
-        for p in list(self.parameters()):
-            nn=1
-            for s in list(p.size()):
-                nn = nn*s
-            pp += nn
-        return pp
-    
-    def save(self, arg):
-        torch.save(self.state_dict(), 'weights/wav2letter_'+str(arg)+'.pkl')
-        
-    def load(self, path):
-        self.load_state_dict(torch.load(path))
+    def forward(self, x):
+        encs = []
+        for stream in self.streams:
+            encs += [stream(x)]
+        enc = torch.cat(encs, dim=2)
+        h = self.dense(enc)
+        h = h.permute(0,2,1)
+        h = self.do(self.bn(self.relu(h)))
+        return F.log_softmax(h, dim=1)
