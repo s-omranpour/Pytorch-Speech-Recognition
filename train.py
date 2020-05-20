@@ -26,7 +26,7 @@ print('num classes:',dataset.intencode.grapheme_count)
 
 ## Defining the deep model
 num_channels = 64
-num_classes = main_dataset.intencode.grapheme_count
+num_classes = dataset.intencode.grapheme_count
 ctc_loss = nn.CTCLoss(reduction='sum', zero_infinity=True)
 device = torch.device('cuda:0')
 
